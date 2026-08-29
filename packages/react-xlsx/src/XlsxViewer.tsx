@@ -20,6 +20,7 @@ import {
   resolveViewerPalette,
   type ViewerPalette
 } from "./viewer-palette";
+import { buildInitialViewportKey } from "./viewer-scroll";
 import type {
   XlsxChart,
   XlsxChartElementSelection,
@@ -8325,16 +8326,13 @@ function XlsxGrid({
   ]);
 
   React.useEffect(() => {
-    const initialScrollKey = [
+    const initialScrollKey = buildInitialViewportKey({
       displayFileName,
       activeSheetIndex,
-      activeSheet?.workbookSheetIndex ?? -1,
-      activeSheet?.name ?? "",
-      activeSheet?.minUsedRow ?? -1,
-      activeSheet?.minUsedCol ?? -1,
-      isWorkerBacked ? "worker" : "main"
-    ].join("|");
-    if (initialScrollKeyRef.current === initialScrollKey) {
+      activeSheet,
+      isWorkerBacked: Boolean(isWorkerBacked)
+    });
+    if (!initialScrollKey || initialScrollKeyRef.current === initialScrollKey) {
       return;
     }
 
