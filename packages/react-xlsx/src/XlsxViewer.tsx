@@ -5,6 +5,7 @@ import {
   useVirtualizer
 } from "@tanstack/react-virtual";
 import { resolveCellTextClipOverscan } from "./cell-text-clip";
+import { applyFormulaPointInsert, type FormulaPointSpan } from "./formula-point-mode";
 import { resolveWorkbookColor, resolveWorkbookFillStyle } from "./colors";
 import { useXlsxViewerController, XlsxFileSizeLimitExceededError } from "./controller";
 import { MemoChartSvg } from "./chart-renderer";
@@ -6926,6 +6927,11 @@ function XlsxGrid({
   >(null);
   const [editingCell, setEditingCell] = React.useState<XlsxCellAddress | null>(null);
   const [editingValue, setEditingValue] = React.useState("");
+  const editingValueRef = React.useRef("");
+  editingValueRef.current = editingValue;
+  // Reference span inserted by formula point mode; a subsequent cell click
+  // replaces it, and any keystroke ends the replace window.
+  const formulaPointSpanRef = React.useRef<FormulaPointSpan | null>(null);
   const [openTableMenu, setOpenTableMenu] = React.useState<{ col: number; row: number; tableName: string } | null>(null);
   const [fillPreviewRange, setFillPreviewRange] = React.useState<XlsxCellRange | null>(null);
   const [chartPreviewRect, setChartPreviewRect] = React.useState<{ id: string; rect: XlsxImageRect } | null>(null);
@@ -9062,6 +9068,7 @@ function XlsxGrid({
 
       selectCell(cell);
       setEditingCell(cell);
+      formulaPointSpanRef.current = null;
       // Formula cells edit as their formula text, Excel-style; committing
       // the display value instead would silently flatten the formula.
       const existingFormula = initialValue === undefined ? getControllerCellFormula(cell) : "";
@@ -9079,6 +9086,7 @@ function XlsxGrid({
     if (!editingCell) {
       return;
     }
+    formulaPointSpanRef.current = null;
 
     if (readOnly) {
       editingCellRef.current = null;
@@ -9096,6 +9104,7 @@ function XlsxGrid({
   }, [editingCell, editingValue, focusGrid, readOnly, setCellValue]);
 
   const cancelEditing = React.useCallback(() => {
+    formulaPointSpanRef.current = null;
     editingCellRef.current = null;
     setEditingCell(null);
     setEditingValue("");
@@ -10976,6 +10985,39 @@ function XlsxGrid({
     openHyperlink(cellData.hyperlink.target, cellData.hyperlink.location);
   }, [openHyperlink]);
 
+  // Excel-style formula point mode: while the editor holds a formula that
+  // can accept a reference, clicking another cell inserts that cell's
+  // reference (a second click replaces it) instead of committing the edit.
+  const tryFormulaPointInsert = React.useCallback((cell: XlsxCellAddress): boolean => {
+    if (!editingCellRef.current || readOnlyRef.current) {
+      return false;
+    }
+    const insertion = applyFormulaPointInsert(
+      editingValueRef.current,
+      formulaPointSpanRef.current,
+      cellAddressToA1(cell)
+    );
+    if (!insertion) {
+      return false;
+    }
+    formulaPointSpanRef.current = insertion.span;
+    setEditingValue(insertion.next);
+    // The pointerdown default was prevented so the editor keeps focus, but
+    // restore it defensively and park the caret after the reference.
+    requestAnimationFrame(() => {
+      const input = editingInputRef.current;
+      if (input && editingCellRef.current) {
+        input.focus();
+        try {
+          input.setSelectionRange(insertion.caret, insertion.caret);
+        } catch {
+          // Non-text inputs throw; the caret position is best-effort.
+        }
+      }
+    });
+    return true;
+  }, []);
+
   const handleCellPointerDown = React.useCallback((
     event: React.PointerEvent<HTMLTableCellElement>,
     cell: XlsxCellAddress
@@ -10985,12 +11027,21 @@ function XlsxGrid({
     }
 
     event.preventDefault();
-    focusGrid();
-    axisSelectionRef.current = null;
-    const targetCell =
+    const pointerTargetCell =
       event.currentTarget.colSpan > 1 || event.currentTarget.rowSpan > 1
         ? resolvePointerCellFromGeometry(event.clientX, event.clientY) ?? cell
         : cell;
+    if (
+      editingCellRef.current
+      && !isSameCell(activeCellRef.current, pointerTargetCell)
+      && tryFormulaPointInsert(pointerTargetCell)
+    ) {
+      // Stay in the edit session: no focus steal, no selection move.
+      return;
+    }
+    focusGrid();
+    axisSelectionRef.current = null;
+    const targetCell = pointerTargetCell;
     const currentSelection = selectionRef.current;
     const anchor = event.shiftKey && currentSelection ? currentSelection.start : targetCell;
     const initialRange = normalizeRange({ start: anchor, end: targetCell });
@@ -11037,6 +11088,7 @@ function XlsxGrid({
     applyPreviewOverlayFromElement,
     commitSelectionRange,
     focusGrid,
+    tryFormulaPointInsert,
     resolveCellPointerOrigin,
     resolveCellPointerOriginFromClient,
     resolveMountedCellOverlayRect,
@@ -15429,7 +15481,10 @@ function XlsxGrid({
                       ref={editingInputRef}
                       autoFocus
                       onBlur={handleEditingBlur}
-                      onChange={(event) => setEditingValue(event.target.value)}
+                      onChange={(event) => {
+                        formulaPointSpanRef.current = null;
+                        setEditingValue(event.target.value);
+                      }}
                       onKeyDown={(event) => {
                         event.stopPropagation();
                         if (event.key === "Enter") {
