@@ -1090,10 +1090,18 @@ export interface XlsxViewerController {
   maxZoomScale: number;
   minZoomScale: number;
   moveImageBy: (id: string, deltaX: number, deltaY: number) => void;
+  /**
+   * Moves a worksheet from one zero-based workbook worksheet index to another.
+   * Worksheet-owned cells, drawings, metadata, history, and serialized tab
+   * order move together. Chartsheet slots remain in place.
+   */
+  moveSheet: (from: number, to: number) => void;
   removeActiveSheet: () => void;
   /** Removes a Duke-supported control by its worksheet-local index. */
   removeFormControl: (controlIndex: number, sheetIndex?: number) => boolean;
   readOnly: boolean;
+  /** Renames a zero-based workbook worksheet index and updates workbook references to it. */
+  renameSheet: (index: number, name: string) => void;
   recalculate: () => void;
   revision: number;
   /**
@@ -1257,12 +1265,14 @@ export interface XlsxViewerEditing {
   getFormControlItems: (controlIndex: number, sheetIndex?: number) => string[];
   getSheetFormControls: (sheetIndex?: number) => XlsxFormControl[];
   mergeSelection: () => void;
+  moveSheet: (from: number, to: number) => void;
   pasteFromClipboard: () => Promise<boolean>;
   pasteStructuredClipboardData: (payload: string) => boolean;
   pasteText: (text: string) => boolean;
   removeActiveSheet: () => void;
   removeFormControl: (controlIndex: number, sheetIndex?: number) => boolean;
   readOnly: boolean;
+  renameSheet: (index: number, name: string) => void;
   redo: () => void;
   selectedCellFormula: string;
   selectedChartFormula: string | null;

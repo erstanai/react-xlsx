@@ -270,6 +270,13 @@ These hooks work inside `XlsxViewer` or `XlsxViewerProvider` context.
 - `useXlsxViewerCharts()` for chart, chart element, formula, and chartsheet state
 - `useXlsxViewerThumbnails(options)` for painting worksheet thumbnails into your own canvases
 
+Worksheet tab controls can call `renameSheet(workbookSheetIndex, name)` and
+`moveSheet(fromWorkbookSheetIndex, toWorkbookSheetIndex)` on the full
+controller or `useXlsxViewerEditing()`. These arguments are zero-based indexes
+in the workbook's complete worksheet collection, not positions in the filtered
+visible-tab list. This keeps operations correct when hidden worksheets are not
+rendered.
+
 ## Form Control Editing
 
 When `readOnly={false}`, Duke-backed checkboxes, option buttons, dropdowns, list boxes, scrollbars, and spinners are interactive. Changes update linked cells immediately, participate in undo/redo, and are written by `exportXlsx()` / `download()`.

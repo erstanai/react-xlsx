@@ -56,6 +56,12 @@ import {
 import { safeCalculate, tryRecalculate } from "./safe-calculate";
 import { canUseConfiguredWasmSourceInWorker, getSheetsWasmModule } from "./wasm";
 import { XlsxWorkerClient } from "./worker-client";
+import {
+  moveArrayEntry,
+  movedArrayIndex,
+  moveWorkbookIndexedEntries,
+  moveWorkbookIndexedGroups
+} from "./worksheet-order";
 import { normalizeWorkbookArrayBuffer } from "./zip-entry-names";
 import type {
   UseXlsxViewerControllerOptions,
@@ -1805,6 +1811,92 @@ function downloadUrl(src: string, fileName: string) {
   anchor.remove();
 }
 
+function padSheetGroups<T>(groups: readonly (readonly T[])[], sheetCount: number): T[][] {
+  return Array.from({ length: sheetCount }, (_, index) => [...(groups[index] ?? [])]);
+}
+
+function padNullableSheetEntries<T>(
+  entries: readonly (T | null)[],
+  sheetCount: number
+): Array<T | null> {
+  return Array.from({ length: sheetCount }, (_, index) => entries[index] ?? null);
+}
+
+function reorderWorkbookImageAssets(
+  assets: WorkbookImageAssets,
+  from: number,
+  to: number,
+  sheetCount: number
+) {
+  assets.formControlsByWorkbookSheetIndex = moveWorkbookIndexedGroups(
+    padSheetGroups(assets.formControlsByWorkbookSheetIndex, sheetCount),
+    from,
+    to
+  );
+  assets.imagesByWorkbookSheetIndex = moveWorkbookIndexedGroups(
+    padSheetGroups(assets.imagesByWorkbookSheetIndex, sheetCount),
+    from,
+    to
+  );
+  assets.shapesByWorkbookSheetIndex = moveWorkbookIndexedGroups(
+    padSheetGroups(assets.shapesByWorkbookSheetIndex, sheetCount),
+    from,
+    to
+  );
+  assets.sheetStatesByWorkbookSheetIndex = moveArrayEntry(
+    padNullableSheetEntries(assets.sheetStatesByWorkbookSheetIndex, sheetCount),
+    from,
+    to
+  );
+  assets.sheetOrigins = moveWorkbookIndexedEntries(
+    padNullableSheetEntries(assets.sheetOrigins, sheetCount),
+    from,
+    to
+  );
+  assets.tableMetadataByWorkbookSheetIndex = moveArrayEntry(
+    padSheetGroups(assets.tableMetadataByWorkbookSheetIndex, sheetCount),
+    from,
+    to
+  );
+  for (const origin of assets.imageOriginsById.values()) {
+    origin.workbookSheetIndex = movedArrayIndex(origin.workbookSheetIndex, from, to);
+  }
+}
+
+function remapZoomOverridesForMovedSheet(
+  current: Record<string, number>,
+  previousTabs: XlsxWorkbookTab[],
+  nextTabs: XlsxWorkbookTab[],
+  from: number,
+  to: number
+) {
+  const previousValues = new Map(previousTabs.map((tab) => [tab.id, current[tab.id]]));
+  const next = { ...current };
+  for (const tab of previousTabs) {
+    delete next[tab.id];
+  }
+
+  for (const tab of previousTabs) {
+    const value = previousValues.get(tab.id);
+    if (value === undefined) {
+      continue;
+    }
+    const nextTab = tab.kind === "sheet" && typeof tab.workbookSheetIndex === "number"
+      ? nextTabs.find((candidate) => (
+          candidate.kind === "sheet"
+          && candidate.workbookSheetIndex === movedArrayIndex(tab.workbookSheetIndex as number, from, to)
+        ))
+      : nextTabs.find((candidate) => (
+          candidate.kind === "chartsheet"
+          && candidate.chartsheetIndex === tab.chartsheetIndex
+        ));
+    if (nextTab) {
+      next[nextTab.id] = value;
+    }
+  }
+  return next;
+}
+
 export function useXlsxViewerController(options: UseXlsxViewerControllerOptions): XlsxViewerController {
   const {
     allowResizeInReadOnly = false,
@@ -3395,6 +3487,16 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setHistoryRevision((current) => current + 1);
   }, [createHistoryEntry]);
 
+  const recordCapturedHistorySnapshot = React.useCallback((snapshot: SnapshotHistoryEntry | null) => {
+    if (isApplyingHistoryRef.current || !snapshot) {
+      return;
+    }
+
+    pushHistoryEntry(undoStackRef.current, snapshot);
+    redoStackRef.current = [];
+    setHistoryRevision((current) => current + 1);
+  }, []);
+
   const addFormControl = React.useCallback((input: XlsxFormControlInput, sheetIndex = activeSheetIndex) => {
     const target = getFormControlWorksheet(sheetIndex);
     if (readOnly || !workbook || !target) {
@@ -4575,6 +4677,176 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setRevision((current) => current + 1);
   }, [readOnly, recordHistoryBeforeMutation, setChartAssets, workbook]);
 
+  const renameSheet = React.useCallback((index: number, name: string) => {
+    const nextName = name.trim();
+    if (
+      readOnly
+      || !workbook
+      || !Number.isInteger(index)
+      || index < 0
+      || index >= workbook.sheetCount
+      || !nextName
+      || workbook.getSheet(index).name === nextName
+    ) {
+      return;
+    }
+
+    const snapshot = createHistoryEntry();
+    // Duke validates duplicate/reserved names and rewrites every supported
+    // cross-sheet reference atomically before returning. Only record history
+    // after it succeeds so a rejected rename is a true no-op.
+    workbook.renameSheet(index, nextName);
+    recordCapturedHistorySnapshot(snapshot);
+    refreshWorkbookState(workbook);
+  }, [createHistoryEntry, readOnly, recordCapturedHistorySnapshot, refreshWorkbookState, workbook]);
+
+  const moveSheet = React.useCallback((from: number, to: number) => {
+    if (
+      readOnly
+      || !workbook
+      || !Number.isInteger(from)
+      || !Number.isInteger(to)
+      || from < 0
+      || to < 0
+      || from >= workbook.sheetCount
+      || to >= workbook.sheetCount
+      || from === to
+    ) {
+      return;
+    }
+
+    const sourceWorkbookSheetIndex = from;
+    const targetWorkbookSheetIndex = to;
+
+    const snapshot = createHistoryEntry();
+    const previousTabs = tabs;
+    const activeWorkbookSheetIndex = activeTab?.kind === "sheet"
+      ? activeTab.workbookSheetIndex
+      : undefined;
+    const activeChartsheetIndex = activeTab?.kind === "chartsheet"
+      ? activeTab.chartsheetIndex
+      : undefined;
+
+    workbook.moveSheet(sourceWorkbookSheetIndex, targetWorkbookSheetIndex);
+    recordCapturedHistorySnapshot(snapshot);
+
+    const sheetCount = workbook.sheetCount;
+    if (imageAssetsRef.current) {
+      reorderWorkbookImageAssets(
+        imageAssetsRef.current,
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex,
+        sheetCount
+      );
+      // Drawing paths moved with their worksheet in Duke. Re-read form-control
+      // state from the reordered workbook while retaining the parsed style
+      // palette used by the view model.
+      imageAssetsRef.current.formControlsByWorkbookSheetIndex = collectWorkbookFormControls(
+        workbook,
+        imageAssetsRef.current.themePalette
+      );
+      sheetOriginsRef.current = imageAssetsRef.current.sheetOrigins.slice();
+      setFormControlsByWorkbookSheetIndex(imageAssetsRef.current.formControlsByWorkbookSheetIndex);
+      setImagesByWorkbookSheetIndex(imageAssetsRef.current.imagesByWorkbookSheetIndex);
+      setShapesByWorkbookSheetIndex(imageAssetsRef.current.shapesByWorkbookSheetIndex);
+    } else {
+      sheetOriginsRef.current = moveWorkbookIndexedEntries(
+        padNullableSheetEntries(sheetOriginsRef.current, sheetCount),
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex
+      );
+      setFormControlsByWorkbookSheetIndex((current) => moveWorkbookIndexedGroups(
+        padSheetGroups(current, sheetCount),
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex
+      ));
+      setImagesByWorkbookSheetIndex((current) => moveWorkbookIndexedGroups(
+        padSheetGroups(current, sheetCount),
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex
+      ));
+      setShapesByWorkbookSheetIndex((current) => moveWorkbookIndexedGroups(
+        padSheetGroups(current, sheetCount),
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex
+      ));
+    }
+
+    setWorkerTablesByWorkbookSheetIndex((current) => moveArrayEntry(
+      padSheetGroups(current, sheetCount),
+      sourceWorkbookSheetIndex,
+      targetWorkbookSheetIndex
+    ));
+    workerCellSnapshotCacheRef.current.clear();
+    setWorkerCellSnapshotRevision((current) => current + 1);
+
+    const nextSheets = buildSheetList(
+      workbook,
+      imageAssetsRef.current?.sheetStatesByWorkbookSheetIndex,
+      imageAssetsRef.current?.themePalette,
+      imageAssetsRef.current?.styleById,
+      imageAssetsRef.current?.namedCellStyleByName,
+      imageAssetsRef.current?.tableStyleByName,
+      showHiddenSheets
+    );
+    const nextChartAssets = loadWorkbookChartAssets(
+      workbook,
+      imageAssetsRef.current,
+      buildVisibleSheetIndexMap(nextSheets),
+      showHiddenSheets
+    );
+    setSheets(nextSheets);
+    setChartAssets(nextChartAssets);
+    setZoomScaleOverridesByTabId((current) => remapZoomOverridesForMovedSheet(
+      current,
+      previousTabs,
+      nextChartAssets.tabs,
+      sourceWorkbookSheetIndex,
+      targetWorkbookSheetIndex
+    ));
+
+    if (typeof activeWorkbookSheetIndex === "number") {
+      const nextWorkbookSheetIndex = movedArrayIndex(
+        activeWorkbookSheetIndex,
+        sourceWorkbookSheetIndex,
+        targetWorkbookSheetIndex
+      );
+      const nextSheetIndex = nextSheets.findIndex(
+        (sheet) => sheet.workbookSheetIndex === nextWorkbookSheetIndex
+      );
+      const nextTabIndex = nextChartAssets.tabs.findIndex(
+        (tab) => tab.kind === "sheet" && tab.workbookSheetIndex === nextWorkbookSheetIndex
+      );
+      if (nextSheetIndex >= 0) {
+        setActiveSheetIndexState(nextSheetIndex);
+      }
+      if (nextTabIndex >= 0) {
+        setActiveTabIndexState(nextTabIndex);
+      }
+    } else if (typeof activeChartsheetIndex === "number") {
+      const nextTabIndex = nextChartAssets.tabs.findIndex(
+        (tab) => tab.kind === "chartsheet" && tab.chartsheetIndex === activeChartsheetIndex
+      );
+      if (nextTabIndex >= 0) {
+        setActiveTabIndexState(nextTabIndex);
+      }
+    }
+
+    setSelectedChartId(null);
+    setSelectedChartElement(null);
+    setRevision((current) => current + 1);
+  }, [
+    activeTab,
+    createHistoryEntry,
+    readOnly,
+    recordCapturedHistorySnapshot,
+    setChartAssets,
+    sheets,
+    showHiddenSheets,
+    tabs,
+    workbook
+  ]);
+
   const removeActiveSheet = React.useCallback(() => {
     if (readOnly || !workbook || !activeSheet) {
       return;
@@ -5006,6 +5278,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       minZoomScale: MIN_ZOOM_SCALE,
       moveChartBy,
       moveImageBy,
+      moveSheet,
       pasteFromClipboard,
       pasteStructuredClipboardData,
       pasteText,
@@ -5014,6 +5287,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       readOnly,
       recalculate,
       redo,
+      renameSheet,
       resetZoom,
       revision,
       serializeXlsx,
@@ -5126,6 +5400,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       resetZoom,
       moveChartBy,
       moveImageBy,
+      moveSheet,
       pasteFromClipboard,
       pasteStructuredClipboardData,
       pasteText,
@@ -5134,6 +5409,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       readOnly,
       recalculate,
       redo,
+      renameSheet,
       revision,
       serializeXlsx,
       resizeChartBy,
