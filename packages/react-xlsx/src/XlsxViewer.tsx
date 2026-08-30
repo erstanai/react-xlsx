@@ -6708,6 +6708,7 @@ function XlsxGrid({
     getRowsBatchAsync,
     getClipboardData,
     getCellDisplayValue: getControllerCellDisplayValue,
+    getCellFormula: getControllerCellFormula,
     getFormControlItems,
     images,
     shapes,
@@ -9061,9 +9062,17 @@ function XlsxGrid({
 
       selectCell(cell);
       setEditingCell(cell);
-      setEditingValue(initialValue ?? getControllerCellDisplayValue(cell));
+      // Formula cells edit as their formula text, Excel-style; committing
+      // the display value instead would silently flatten the formula.
+      const existingFormula = initialValue === undefined ? getControllerCellFormula(cell) : "";
+      setEditingValue(
+        initialValue
+          ?? (existingFormula
+            ? (existingFormula.startsWith("=") ? existingFormula : `=${existingFormula}`)
+            : getControllerCellDisplayValue(cell))
+      );
     },
-    [getControllerCellDisplayValue, readOnly, selectCell]
+    [getControllerCellDisplayValue, getControllerCellFormula, readOnly, selectCell]
   );
 
   const commitEditing = React.useCallback(() => {

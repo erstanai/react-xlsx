@@ -19,7 +19,8 @@ import {
   updateWorkbookChartDefinition,
   type WorkbookChartAssets
 } from "./charts";
-import { parseClipboardText } from "./clipboard";
+import { computePasteStampOffsets, parseClipboardText } from "./clipboard";
+import { offsetFormulaReferences } from "./formula-references";
 import { resolveWorkbookColor, resolveWorkbookFillStyle } from "./colors";
 import {
   collectWorkbookFormControls,
@@ -393,6 +394,12 @@ type ClipboardPayload = {
   cols: number;
   merges: ClipboardMerge[];
   rows: number;
+  /**
+   * Top-left cell of the copied range. Lets paste adjust relative formula
+   * references by the move delta, Excel-style. Absent in payloads written by
+   * older builds, which paste formulas verbatim.
+   */
+  origin?: { col: number; row: number };
 };
 
 function resolveDisplayFileName(src?: string, fileName?: string): string {
@@ -3033,6 +3040,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       cells: [],
       cols: normalized.end.col - normalized.start.col + 1,
       merges: [],
+      origin: { col: normalized.start.col, row: normalized.start.row },
       rows: normalized.end.row - normalized.start.row + 1
     };
 
@@ -4273,8 +4281,22 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return;
     }
 
-    const nextValue = coerceUserEnteredValue(value);
-    worksheet.setCell(cellAddressToA1(cell), nextValue);
+    const trimmedInput = value.trim();
+    if (trimmedInput.startsWith("=") && trimmedInput.length > 1) {
+      // Grid input starting with "=" is a formula, exactly like the paste
+      // and formula-bar paths. A leading apostrophe escape ('=text) does not
+      // reach this branch because the raw value starts with the apostrophe.
+      try {
+        worksheet.setFormula(cellAddressToA1(cell), trimmedInput);
+      } catch {
+        // The engine rejected the expression; keep the user's text rather
+        // than losing the input.
+        worksheet.setCell(cellAddressToA1(cell), value);
+      }
+    } else {
+      const nextValue = coerceUserEnteredValue(value);
+      worksheet.setCell(cellAddressToA1(cell), nextValue);
+    }
     const after = captureCellMutationState(cell);
     if (!after) {
       return;
@@ -4446,7 +4468,12 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
         const sourceStyle = cloneCellStyle(worksheet.getCellStyleAt(sourceRow, sourceCol));
 
         if (sourceFormula) {
-          worksheet.setFormula(cellAddressToA1(targetCell), sourceFormula);
+          // Fill adjusts relative references by the per-cell move delta,
+          // exactly like dragging the fill handle in Excel.
+          worksheet.setFormula(
+            cellAddressToA1(targetCell),
+            offsetFormulaReferences(sourceFormula, row - sourceRow, col - sourceCol)
+          );
         } else {
           const sourceValue = normalizeCellValue(worksheet.getCellAt(sourceRow, sourceCol).toJs());
           worksheet.setCell(cellAddressToA1(targetCell), sourceValue);
@@ -4616,33 +4643,44 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return false;
     }
 
+    const clipRows = grid.length;
+    const clipCols = Math.max(...grid.map((row) => row.length), 1);
+    const selectedRange = selection ? normalizeRange(selection) : null;
+    const stamps = selectedRange
+      ? computePasteStampOffsets(
+          selectedRange.end.row - selectedRange.start.row + 1,
+          selectedRange.end.col - selectedRange.start.col + 1,
+          clipRows,
+          clipCols
+        )
+      : [{ colOffset: 0, rowOffset: 0 }];
+    const tiled = stamps.length > 1;
+    // Tiled fills anchor at the selection's top-left; a single stamp keeps
+    // the anchor cell so paste lands where the cursor is.
+    const anchor = tiled && selectedRange ? selectedRange.start : targetCell;
+
     const mutations: RangeCellMutation[] = [];
-    for (let rowIndex = 0; rowIndex < grid.length; rowIndex += 1) {
-      const row = grid[rowIndex] ?? [];
-      for (let colIndex = 0; colIndex < row.length; colIndex += 1) {
-        const rawValue = row[colIndex] ?? "";
-        const nextCell = {
-          col: targetCell.col + colIndex,
-          row: targetCell.row + rowIndex
-        };
-        const before = captureCellMutationState(nextCell);
-        if (!before) {
-          continue;
-        }
-        if (rawValue.startsWith("=") && rawValue.length > 1) {
-          worksheet.setFormula(cellAddressToA1(nextCell), rawValue);
-          const after = captureCellMutationState(nextCell);
-          if (!after) {
+    for (const stamp of stamps) {
+      for (let rowIndex = 0; rowIndex < grid.length; rowIndex += 1) {
+        const row = grid[rowIndex] ?? [];
+        for (let colIndex = 0; colIndex < row.length; colIndex += 1) {
+          const rawValue = row[colIndex] ?? "";
+          const nextCell = {
+            col: anchor.col + stamp.colOffset + colIndex,
+            row: anchor.row + stamp.rowOffset + rowIndex
+          };
+          const before = captureCellMutationState(nextCell);
+          if (!before) {
             continue;
           }
-          mutations.push({
-            after,
-            before,
-            cell: nextCell
-          });
-        } else {
-          const nextValue = coerceUserEnteredValue(rawValue);
-          worksheet.setCell(cellAddressToA1(nextCell), nextValue);
+          if (rawValue.startsWith("=") && rawValue.length > 1) {
+            // Text clipboards carry no copy origin, so the formula is
+            // entered as written in every stamp — Excel's text-paste rule.
+            worksheet.setFormula(cellAddressToA1(nextCell), rawValue);
+          } else {
+            const nextValue = coerceUserEnteredValue(rawValue);
+            worksheet.setCell(cellAddressToA1(nextCell), nextValue);
+          }
           const after = captureCellMutationState(nextCell);
           if (!after) {
             continue;
@@ -4658,17 +4696,19 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     maybeRecalculateWorkbook(workbook);
     refreshWorkbookState(workbook);
-    const nextRange = normalizeRange({
-      start: targetCell,
-      end: {
-        col: targetCell.col + Math.max(0, Math.max(...grid.map((row) => row.length), 1) - 1),
-        row: targetCell.row + grid.length - 1
-      }
-    });
-    setActiveCell(targetCell);
+    const nextRange = tiled && selectedRange
+      ? selectedRange
+      : normalizeRange({
+          start: anchor,
+          end: {
+            col: anchor.col + Math.max(0, clipCols - 1),
+            row: anchor.row + clipRows - 1
+          }
+        });
+    setActiveCell(anchor);
     setSelection(nextRange);
-    selectionAnchorRef.current = targetCell;
-    recordRangeEditHistory(mutations, nextRange, targetCell);
+    selectionAnchorRef.current = anchor;
+    recordRangeEditHistory(mutations, nextRange, anchor);
     return true;
   }, [activeCell, captureCellMutationState, getActiveWorksheet, maybeRecalculateWorkbook, readOnly, recordRangeEditHistory, refreshWorkbookState, selection, workbook]);
 
@@ -4690,33 +4730,46 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return false;
     }
 
+    const clipRows = Math.max(payload.rows ?? 1, 1);
+    const clipCols = Math.max(payload.cols ?? 1, 1);
+    const selectedRange = selection ? normalizeRange(selection) : null;
+    const stamps = selectedRange
+      ? computePasteStampOffsets(
+          selectedRange.end.row - selectedRange.start.row + 1,
+          selectedRange.end.col - selectedRange.start.col + 1,
+          clipRows,
+          clipCols
+        )
+      : [{ colOffset: 0, rowOffset: 0 }];
+    const tiled = stamps.length > 1;
+    const anchor = tiled && selectedRange ? selectedRange.start : targetCell;
+
     const hasMergeOperations = Array.isArray(payload.merges) && payload.merges.some((merge) => (merge.rowSpan ?? 1) > 1 || (merge.colSpan ?? 1) > 1);
     const mutations: RangeCellMutation[] = [];
     if (hasMergeOperations) {
       recordHistoryBeforeMutation();
     }
-    for (const cell of payload.cells) {
-      const nextCell = {
-        col: targetCell.col + cell.colOffset,
-        row: targetCell.row + cell.rowOffset
-      };
-      const before = hasMergeOperations ? null : captureCellMutationState(nextCell);
+    for (const stamp of stamps) {
+      // Internal payloads carry their copy origin, so relative references
+      // shift by the move delta while $-anchored components hold — Excel's
+      // copy/paste rule. The delta is constant within one stamp.
+      const rowDelta = payload.origin ? anchor.row + stamp.rowOffset - payload.origin.row : 0;
+      const colDelta = payload.origin ? anchor.col + stamp.colOffset - payload.origin.col : 0;
+      for (const cell of payload.cells) {
+        const nextCell = {
+          col: anchor.col + stamp.colOffset + cell.colOffset,
+          row: anchor.row + stamp.rowOffset + cell.rowOffset
+        };
+        const before = hasMergeOperations ? null : captureCellMutationState(nextCell);
 
-      if (cell.formula) {
-        worksheet.setFormula(cellAddressToA1(nextCell), cell.formula);
-        if (before) {
-          const after = captureCellMutationState(nextCell);
-          if (!after) {
-            continue;
-          }
-          mutations.push({
-            after,
-            before,
-            cell: nextCell
-          });
+        if (cell.formula) {
+          const formula = payload.origin
+            ? offsetFormulaReferences(cell.formula, rowDelta, colDelta)
+            : cell.formula;
+          worksheet.setFormula(cellAddressToA1(nextCell), formula);
+        } else {
+          worksheet.setCell(cellAddressToA1(nextCell), cell.value);
         }
-      } else {
-        worksheet.setCell(cellAddressToA1(nextCell), cell.value);
         if (before) {
           const after = captureCellMutationState(nextCell);
           if (!after) {
@@ -4729,42 +4782,44 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
           });
         }
       }
-    }
 
-    if (Array.isArray(payload.merges)) {
-      for (const merge of payload.merges) {
-        if ((merge.rowSpan ?? 1) <= 1 && (merge.colSpan ?? 1) <= 1) {
-          continue;
-        }
-
-        const mergeRange = normalizeRange({
-          start: {
-            col: targetCell.col + merge.colOffset,
-            row: targetCell.row + merge.rowOffset
-          },
-          end: {
-            col: targetCell.col + merge.colOffset + merge.colSpan - 1,
-            row: targetCell.row + merge.rowOffset + merge.rowSpan - 1
+      if (Array.isArray(payload.merges)) {
+        for (const merge of payload.merges) {
+          if ((merge.rowSpan ?? 1) <= 1 && (merge.colSpan ?? 1) <= 1) {
+            continue;
           }
-        });
-        worksheet.mergeCells(rangeToA1(mergeRange));
+
+          const mergeRange = normalizeRange({
+            start: {
+              col: anchor.col + stamp.colOffset + merge.colOffset,
+              row: anchor.row + stamp.rowOffset + merge.rowOffset
+            },
+            end: {
+              col: anchor.col + stamp.colOffset + merge.colOffset + merge.colSpan - 1,
+              row: anchor.row + stamp.rowOffset + merge.rowOffset + merge.rowSpan - 1
+            }
+          });
+          worksheet.mergeCells(rangeToA1(mergeRange));
+        }
       }
     }
 
     maybeRecalculateWorkbook(workbook);
     refreshWorkbookState(workbook);
-    const nextRange = normalizeRange({
-      start: targetCell,
-      end: {
-        col: targetCell.col + Math.max((payload.cols ?? 1) - 1, 0),
-        row: targetCell.row + Math.max((payload.rows ?? 1) - 1, 0)
-      }
-    });
-    setActiveCell(targetCell);
+    const nextRange = tiled && selectedRange
+      ? selectedRange
+      : normalizeRange({
+          start: anchor,
+          end: {
+            col: anchor.col + Math.max(clipCols - 1, 0),
+            row: anchor.row + Math.max(clipRows - 1, 0)
+          }
+        });
+    setActiveCell(anchor);
     setSelection(nextRange);
-    selectionAnchorRef.current = targetCell;
+    selectionAnchorRef.current = anchor;
     if (!hasMergeOperations) {
-      recordRangeEditHistory(mutations, nextRange, targetCell);
+      recordRangeEditHistory(mutations, nextRange, anchor);
     }
     return true;
   }, [
