@@ -1,5 +1,6 @@
 import type * as React from "react";
 import type { Workbook, Worksheet } from "@dukelib/sheets-wasm";
+import type { XlsxCellChange, XlsxCellDeltaCapture, XlsxReconcileOptions, XlsxReconcileResult, XlsxStructureTransform } from "./collaboration";
 
 export interface XlsxThemePalette {
   colorsByIndex: Record<number, string>;
@@ -1121,6 +1122,9 @@ export interface XlsxViewerController {
    * undo/redo so local snapshot history cannot overwrite another editor.
    */
   applyRemoteWorkbook: (bytes: Uint8Array, options?: { expectedRevision?: number; canApply?: () => boolean }) => Promise<boolean>;
+  captureCellDelta: (options: { baseRevision: number; structureRevision: number }) => XlsxCellDeltaCapture | null;
+  applyRemoteCells: (changes: XlsxCellChange[], options: XlsxReconcileOptions) => Promise<XlsxReconcileResult>;
+  reconcileRemoteWorkbook: (bytes: Uint8Array, options: XlsxReconcileOptions & { transforms?: XlsxStructureTransform[] }) => Promise<XlsxReconcileResult>;
   resetZoom: () => void;
   resizeChartBy: (
     id: string,

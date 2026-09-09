@@ -21,6 +21,13 @@ import {
 } from "./charts";
 import { computePasteStampOffsets, parseClipboardText } from "./clipboard";
 import { offsetFormulaReferences } from "./formula-references";
+import {
+  addressFromCell, aggregateJournal, captureJournalDelta, cellFromAddress, cellStateContent,
+  cloneCollaborationValue, collaborationEqual, collaborationStyleEqual, normalizeCollaborationStyle, journalCellKey, isCellContent, mergeCellState, stateWithContent,
+  transformCellAddress, transformFormulaReferences,
+  type XlsxCellChange, type XlsxCellDeltaCapture, type XlsxJournalEntry,
+  type XlsxReconcileOptions, type XlsxReconcileResult, type XlsxStructureTransform
+} from "./collaboration";
 import { resolveWorkbookColor, resolveWorkbookFillStyle } from "./colors";
 import {
   collectWorkbookFormControls,
@@ -158,6 +165,7 @@ type CellMutationState = {
 };
 
 type CellEditHistoryEntry = {
+  revision?: number;
   kind: "cell-edit";
   activeCellAfter: XlsxCellAddress | null;
   activeCellBefore: XlsxCellAddress | null;
@@ -176,6 +184,7 @@ type RangeCellMutation = {
 };
 
 type RangeEditHistoryEntry = {
+  revision?: number;
   structural?: boolean;
   kind: "range-edit";
   activeCellAfter: XlsxCellAddress | null;
@@ -1319,12 +1328,10 @@ function applyCellMutationState(
   if (state.formula) {
     worksheet.setFormula(cellAddressToA1(cell), state.formula);
   } else {
-    worksheet.setCell(cellAddressToA1(cell), normalizeCellValue(state.value));
+    worksheet.setCell(cellAddressToA1(cell), state.value ?? null);
   }
 
-  if (state.style && typeof state.style === "object") {
-    worksheet.setCellStyleAt(cell.row, cell.col, state.style);
-  }
+  worksheet.setCellStyleAt(cell.row, cell.col, normalizeCollaborationStyle(state.style));
 }
 
 function escapeHtml(value: string) {
@@ -1940,10 +1947,20 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
   const remoteLoadGenerationRef = React.useRef(0);
   const structureRevisionRef = React.useRef(0);
   const sourceStructureRevisionRef = React.useRef(0);
+  const cellJournalRef = React.useRef<XlsxJournalEntry[]>([]);
+  const journalFloorRevisionRef = React.useRef(0);
+  const unsupportedMutationRevisionRef = React.useRef(0);
+  const appendCellJournal = React.useCallback((worksheet: string, cell: XlsxCellAddress, before: CellMutationState, after: CellMutationState) => {
+    cellJournalRef.current.push(cloneCollaborationValue({ worksheet, cell, before, after, revision: currentRevisionRef.current }));
+    while (cellJournalRef.current.length > 4096) journalFloorRevisionRef.current = cellJournalRef.current.shift()!.revision;
+  }, []);
   const pendingMutationKindRef = React.useRef<"cells" | "structure" | null>(null);
   const advanceRevision = React.useCallback((kind: "cells" | "structure" = "structure") => {
     currentRevisionRef.current += 1;
-    if (kind === "structure") structureRevisionRef.current += 1;
+    if (kind === "structure") {
+      structureRevisionRef.current += 1;
+      unsupportedMutationRevisionRef.current = currentRevisionRef.current;
+    }
     pendingMutationKindRef.current = pendingMutationKindRef.current === "structure" ? "structure" : kind;
     setRevision((current) => current + 1);
   }, []);
@@ -2228,7 +2245,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     };
   }, [skipXmlParsing]);
 
-  const refreshWorkbookState = React.useCallback((targetWorkbook: Workbook, kind: "cells" | "structure" = "structure") => {
+  const refreshWorkbookState = React.useCallback((targetWorkbook: Workbook, kind: "cells" | "structure" = "structure", notify = true) => {
     const currentFormControls = imageAssetsRef.current?.formControlsByWorkbookSheetIndex ?? [];
     const nextFormControls = refreshWorkbookFormControls(
       targetWorkbook,
@@ -2257,7 +2274,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
         showHiddenSheets
       )
     );
-    advanceRevision(kind);
+    if (notify) advanceRevision(kind);
   }, [advanceRevision, setChartAssets, showHiddenSheets]);
 
   React.useEffect(() => () => {
@@ -2293,6 +2310,9 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
   React.useEffect(() => {
     remoteLoadGenerationRef.current += 1;
+    cellJournalRef.current = [];
+    journalFloorRevisionRef.current = 0;
+    unsupportedMutationRevisionRef.current = 0;
     if (!file && !src) {
       disposeWorkerClient();
       setForcedReadOnly(false);
@@ -3431,11 +3451,239 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     currentRevisionRef.current = nextRevision;
     structureRevisionRef.current += 1;
     sourceStructureRevisionRef.current = structureRevisionRef.current;
+    cellJournalRef.current = [];
+    journalFloorRevisionRef.current = nextRevision;
+    unsupportedMutationRevisionRef.current = nextRevision;
     pendingMutationKindRef.current = null;
     mutationNotificationStateRef.current = { baselineRevision: nextRevision, pendingRevision: null };
     setRevision(nextRevision);
     return true;
   }, [disposeWorkerClient, isLoading, loadWorkbookOnMainThread, setChartAssets, setImageAssets, showHiddenSheets]);
+
+  const captureCellDelta = React.useCallback((options: { baseRevision: number; structureRevision: number }): XlsxCellDeltaCapture | null => {
+    if (options.baseRevision < journalFloorRevisionRef.current || isLoading || isChartsLoading) return null;
+    return captureJournalDelta(cellJournalRef.current, options.baseRevision, currentRevisionRef.current, options.structureRevision, structureRevisionRef.current, unsupportedMutationRevisionRef.current);
+  }, [isLoading, isChartsLoading]);
+
+  const applyRemoteCells = React.useCallback(async (changes: XlsxCellChange[], options: XlsxReconcileOptions): Promise<XlsxReconcileResult> => {
+    const currentRevision = currentRevisionRef.current;
+    const acknowledged = options.acknowledgedRevision ?? options.baseRevision;
+    const rejected = (reason: string, worksheet = "", address = ""): XlsxReconcileResult => ({
+      applied: false, revision: currentRevisionRef.current, cleanRevision: options.baseRevision,
+      structureRevision: structureRevisionRef.current, dirty: currentRevisionRef.current !== options.baseRevision,
+      conflicts: [{ worksheet, address, property: "content", reason }]
+    });
+    if (!workbook || isLoading || isChartsLoading || options.canApply?.() === false || (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision)) return rejected("editor_busy");
+    if (options.baseRevision < journalFloorRevisionRef.current || acknowledged < options.baseRevision || acknowledged > currentRevision
+      || unsupportedMutationRevisionRef.current > acknowledged) return rejected("unreplayable_local_structure");
+    if (changes.length > 1000) return rejected("cell_delta_limit");
+    const journal = cellJournalRef.current.filter((entry) => entry.revision > options.baseRevision);
+    const known = new Map(aggregateJournal(journal).map((entry) => [journalCellKey(entry.worksheet, entry.cell), entry]));
+    const pending = aggregateJournal(journal.filter((entry) => entry.revision > acknowledged));
+    const pendingByKey = new Map(pending.map((entry) => [journalCellKey(entry.worksheet, entry.cell), entry]));
+    const accepted = new Map(aggregateJournal(journal.filter((entry) => entry.revision <= acknowledged)).map((entry) => [journalCellKey(entry.worksheet, entry.cell), entry]));
+    const remote = new Map<string, { worksheet: string; cell: XlsxCellAddress; before: CellMutationState; after: CellMutationState }>();
+    const sheetIndexes = new Map(Array.from({ length: workbook.sheetCount }, (_, index) => [workbook.getSheet(index).name, index]));
+    const readState = (worksheet: string, cell: XlsxCellAddress): CellMutationState | null => {
+      const index = sheetIndexes.get(worksheet);
+      if (index === undefined) return null;
+      const sheet = workbook.getSheet(index);
+      return { value: sheet.getCellAt(cell.row, cell.col).toJs(), formula: sheet.getFormulaAt(cell.row, cell.col) ?? null, style: sheet.getCellStyleAt(cell.row, cell.col) };
+    };
+    try {
+      for (const change of changes) {
+        if (!isCellContent(change.before) || !isCellContent(change.after)) return rejected("unsupported_cell_content", change.worksheet, change.address);
+        const cell = cellFromAddress(change.address);
+        const key = journalCellKey(change.worksheet, cell);
+        const prior = remote.get(key);
+        const baseline = prior?.after ?? known.get(key)?.before ?? readState(change.worksheet, cell);
+        if (!baseline || !collaborationEqual(cellStateContent(baseline), change.before)) return rejected("remote_base_mismatch", change.worksheet, change.address);
+        if (!cellStateContent(stateWithContent(baseline, change.after))) return rejected("unsupported_cell_content", change.worksheet, change.address);
+        remote.set(key, { worksheet: change.worksheet, cell, before: prior?.before ?? baseline, after: stateWithContent(baseline, change.after) });
+      }
+    } catch { return rejected("invalid_remote_delta"); }
+    const staged = new Map<string, { worksheet: string; cell: XlsxCellAddress; before: CellMutationState; after: CellMutationState }>();
+    for (const [key, entry] of remote) {
+      const live = pendingByKey.get(key)?.before ?? readState(entry.worksheet, entry.cell)!;
+      staged.set(key, { ...entry, before: stateWithContent(live, cellStateContent(entry.after)!), after: stateWithContent(live, cellStateContent(entry.after)!) });
+    }
+    for (const entry of pending) {
+      const key = journalCellKey(entry.worksheet, entry.cell);
+      const baseline = staged.get(key)?.before ?? entry.before;
+      const merged = mergeCellState(entry.before, entry.after, baseline);
+      if (merged.conflicts.length) return { ...rejected("concurrent_cell_property", entry.worksheet, addressFromCell(entry.cell)), conflicts: merged.conflicts.map((property) => ({ worksheet: entry.worksheet, address: addressFromCell(entry.cell), property, reason: "concurrent_cell_property" })) };
+      staged.set(key, { worksheet: entry.worksheet, cell: entry.cell, before: baseline, after: merged.state });
+    }
+    const external = new Map([...remote].filter(([key, entry]) => !accepted.has(key) || !collaborationEqual(cellStateContent(accepted.get(key)!.after), cellStateContent(entry.after))));
+    const cleanRevision = currentRevision + 1;
+    const remaining = [...staged.values()].filter((entry) => !collaborationEqual(cellStateContent(entry.before), cellStateContent(entry.after)) || !collaborationStyleEqual(entry.before.style, entry.after.style));
+    const nextRevision = cleanRevision + (remaining.length ? 1 : 0);
+    const rebaseHistory = (stack: HistoryEntry[]): HistoryEntry[] => {
+      const lastSnapshot = stack.reduce((found, entry, index) => entry.kind === "snapshot" || (entry.kind === "range-edit" && entry.structural) ? index : found, -1);
+      return stack.slice(lastSnapshot + 1).flatMap((entry): HistoryEntry[] => {
+        if (entry.kind === "snapshot") return [];
+        const name = workbook.getSheet(entry.sheetIndex).name;
+        const mutations = (entry.kind === "cell-edit" ? [{ cell: entry.cell, before: entry.before, after: entry.after }] : entry.mutations).flatMap((mutation) => {
+          const content = external.get(journalCellKey(name, mutation.cell));
+          const next = content ? { ...mutation, before: stateWithContent(mutation.before, cellStateContent(content.after)!), after: stateWithContent(mutation.after, cellStateContent(content.after)!) } : mutation;
+          return collaborationEqual(cellStateContent(next.before), cellStateContent(next.after)) && collaborationStyleEqual(next.before.style, next.after.style) ? [] : [next];
+        });
+        if (!mutations.length) return [];
+        const revision = (entry.revision ?? 0) > acknowledged ? nextRevision : entry.revision;
+        return entry.kind === "cell-edit" ? [{ ...entry, ...mutations[0], revision }] : [{ ...entry, mutations, revision }];
+      });
+    };
+    // All validation precedes mutation. Application is synchronous, so input
+    // cannot arrive between the revision check and this commit.
+    const nextUndo = rebaseHistory(undoStackRef.current), nextRedo = rebaseHistory(redoStackRef.current);
+    const originals = [...staged.values()].map((entry) => ({ ...entry, state: readState(entry.worksheet, entry.cell)! }));
+    try {
+      for (const entry of staged.values()) applyCellMutationState(workbook.getSheet(sheetIndexes.get(entry.worksheet)!), entry.cell, entry.after);
+      maybeRecalculateWorkbook(workbook);
+    } catch {
+      for (const entry of originals) applyCellMutationState(workbook.getSheet(sheetIndexes.get(entry.worksheet)!), entry.cell, entry.state);
+      maybeRecalculateWorkbook(workbook);
+      refreshWorkbookState(workbook, "cells", false);
+      return rejected("unsupported_remote_content");
+    }
+    undoStackRef.current = nextUndo;
+    redoStackRef.current = nextRedo;
+    refreshWorkbookState(workbook, "cells", false);
+    cellJournalRef.current = remaining.map((entry) => ({ ...cloneCollaborationValue(entry), revision: nextRevision }));
+    journalFloorRevisionRef.current = cleanRevision;
+    unsupportedMutationRevisionRef.current = Math.min(unsupportedMutationRevisionRef.current, cleanRevision);
+    currentRevisionRef.current = nextRevision;
+    pendingMutationKindRef.current = null;
+    mutationNotificationStateRef.current = { baselineRevision: nextRevision, pendingRevision: null };
+    setRevision(nextRevision);
+    setHistoryRevision((value) => value + 1);
+    return { applied: true, revision: nextRevision, cleanRevision, structureRevision: structureRevisionRef.current, dirty: remaining.length > 0 };
+  }, [isLoading, isChartsLoading, maybeRecalculateWorkbook, refreshWorkbookState, workbook]);
+
+  const reconcileRemoteWorkbook = React.useCallback(async (bytes: Uint8Array, options: XlsxReconcileOptions & { transforms?: XlsxStructureTransform[] }): Promise<XlsxReconcileResult> => {
+    const currentRevision = currentRevisionRef.current;
+    const acknowledged = options.acknowledgedRevision ?? options.baseRevision;
+    const transforms = options.transforms ?? [];
+    const structureKnown = options.structureUnchanged === true || transforms.length > 0;
+    const rejected = (reason: string, worksheet = "", address = ""): XlsxReconcileResult => ({
+      applied: false, revision: currentRevisionRef.current, cleanRevision: options.baseRevision,
+      structureRevision: structureRevisionRef.current, dirty: currentRevisionRef.current !== options.baseRevision,
+      conflicts: [{ worksheet, address, property: "content", reason }]
+    });
+    if (!workbook || isLoading || options.canApply?.() === false || (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision)) return rejected("editor_busy");
+    if (options.baseRevision < journalFloorRevisionRef.current || acknowledged < options.baseRevision || acknowledged > currentRevision
+      || unsupportedMutationRevisionRef.current > acknowledged) return rejected("unreplayable_local_structure");
+    const pending = aggregateJournal(cellJournalRef.current.filter((entry) => entry.revision > acknowledged));
+    if (pending.length && !structureKnown) return rejected("unknown_structure");
+    const generation = ++remoteLoadGenerationRef.current;
+    const parsed = await loadWorkbookOnMainThread(cloneBytes(bytes).buffer as ArrayBuffer);
+    const discard = (result: XlsxReconcileResult) => { revokeWorkbookImageAssets(parsed.imageAssets); return result; };
+    if (generation !== remoteLoadGenerationRef.current || currentRevisionRef.current !== currentRevision || options.canApply?.() === false) return discard(rejected("editor_changed"));
+    const nextWorkbook = parsed.parsedWorkbook.workbook;
+    const nextIndexes = new Map(Array.from({ length: nextWorkbook.sheetCount }, (_, index) => [nextWorkbook.getSheet(index).name, index]));
+    const stateAt = (target: Workbook, index: number, cell: XlsxCellAddress): CellMutationState => {
+      const sheet = target.getSheet(index);
+      return { value: sheet.getCellAt(cell.row, cell.col).toJs(), formula: sheet.getFormulaAt(cell.row, cell.col) ?? null, style: sheet.getCellStyleAt(cell.row, cell.col) };
+    };
+    const transformState = (state: CellMutationState, worksheet: string): CellMutationState => ({
+      ...cloneCollaborationValue(state), formula: state.formula && transforms.length ? transformFormulaReferences(state.formula.replace(/^=/, ""), worksheet, transforms) : state.formula
+    });
+    const remaining: Array<Omit<XlsxJournalEntry, "revision">> = [];
+    const mappedPending = new Map<string, XlsxJournalEntry>();
+    try {
+      // Validate transform identity/bounds even for an empty pending journal.
+      transformCellAddress({ row: 0, col: 0 }, "", transforms);
+      for (const entry of pending) {
+        const cell = transformCellAddress(entry.cell, entry.worksheet, transforms);
+        const index = nextIndexes.get(entry.worksheet);
+        if (!cell || index === undefined) return discard(rejected("deleted_local_target", entry.worksheet, addressFromCell(entry.cell)));
+        const before = transformState(entry.before, entry.worksheet), after = transformState(entry.after, entry.worksheet);
+        const remote = stateAt(nextWorkbook, index, cell);
+        const merged = mergeCellState(before, after, remote);
+        if (merged.conflicts.length) return discard({ ...rejected("concurrent_cell_property"), conflicts: merged.conflicts.map((property) => ({ worksheet: entry.worksheet, address: addressFromCell(cell), property, reason: "concurrent_cell_property" })) });
+        mappedPending.set(journalCellKey(entry.worksheet, entry.cell), { ...entry, before, after });
+        if (!collaborationEqual(cellStateContent(remote), cellStateContent(merged.state)) || !collaborationStyleEqual(remote.style, merged.state.style)) {
+          remaining.push({ worksheet: entry.worksheet, cell, before: remote, after: merged.state });
+        }
+      }
+    } catch { return discard(rejected("unsupported_formula_transform")); }
+    const cleanRevision = currentRevision + 1;
+    const nextRevision = cleanRevision + (remaining.length ? 1 : 0);
+    const mapSelection = (range: XlsxCellRange | null, worksheet: string): XlsxCellRange | null => {
+      if (!range) return null;
+      const start = transformCellAddress(range.start, worksheet, transforms), end = transformCellAddress(range.end, worksheet, transforms);
+      return start && end ? { start, end } : null;
+    };
+    const rebaseHistory = (stack: HistoryEntry[]): HistoryEntry[] => {
+      if (!structureKnown) return [];
+      const lastSnapshot = stack.reduce((found, entry, index) => entry.kind === "snapshot" || (entry.kind === "range-edit" && entry.structural) ? index : found, -1);
+      return stack.slice(lastSnapshot + 1).flatMap((entry): HistoryEntry[] => {
+        if (entry.kind === "snapshot") return [];
+        const name = workbook.getSheet(entry.sheetIndex).name;
+        const sheetIndex = nextIndexes.get(name);
+        if (sheetIndex === undefined) return [];
+        const mutations = (entry.kind === "cell-edit" ? [{ cell: entry.cell, before: entry.before, after: entry.after }] : entry.mutations).flatMap((mutation) => {
+          try {
+            const cell = transformCellAddress(mutation.cell, name, transforms);
+            if (!cell) return [];
+            const pendingBase = mappedPending.get(journalCellKey(name, mutation.cell))?.before;
+            const baseline = pendingBase ?? transformState(stateAt(workbook, entry.sheetIndex, mutation.cell), name);
+            const remote = stateAt(nextWorkbook, sheetIndex, cell);
+            const before = mergeCellState(baseline, transformState(mutation.before, name), remote).state;
+            const after = mergeCellState(baseline, transformState(mutation.after, name), remote).state;
+            return collaborationEqual(cellStateContent(before), cellStateContent(after)) && collaborationStyleEqual(before.style, after.style) ? [] : [{ cell, before, after }];
+          } catch { return []; }
+        });
+        if (!mutations.length) return [];
+        const common = {
+          sheetIndex, revision: (entry.revision ?? 0) > acknowledged ? nextRevision : entry.revision,
+          activeCellBefore: entry.activeCellBefore ? transformCellAddress(entry.activeCellBefore, name, transforms) : null,
+          activeCellAfter: entry.activeCellAfter ? transformCellAddress(entry.activeCellAfter, name, transforms) : null,
+          selectionBefore: mapSelection(entry.selectionBefore, name), selectionAfter: mapSelection(entry.selectionAfter, name)
+        };
+        return entry.kind === "cell-edit" ? [{ ...entry, ...mutations[0], ...common }] : [{ ...entry, mutations, ...common }];
+      });
+    };
+    const nextUndo = rebaseHistory(undoStackRef.current), nextRedo = rebaseHistory(redoStackRef.current);
+    try {
+      for (const entry of remaining) applyCellMutationState(nextWorkbook.getSheet(nextIndexes.get(entry.worksheet)!), entry.cell, entry.after);
+      maybeRecalculateWorkbook(nextWorkbook);
+    } catch { return discard(rejected("unsupported_pending_content")); }
+    const assets = parsed.imageAssets;
+    const nextSheets = buildSheetList(nextWorkbook, assets.sheetStatesByWorkbookSheetIndex, assets.themePalette, assets.styleById, assets.namedCellStyleByName, assets.tableStyleByName, showHiddenSheets);
+    const prior = remoteSelectionRef.current;
+    const matchingIndex = nextSheets.findIndex((sheet) => sheet.name === prior.sheetName);
+    const nextIndex = matchingIndex >= 0 ? matchingIndex : Math.max(0, Math.min(prior.activeSheetIndex, nextSheets.length - 1));
+    const charts = loadWorkbookChartAssets(nextWorkbook, assets, buildVisibleSheetIndexMap(nextSheets), showHiddenSheets);
+    chartLoadRequestTokenRef.current += 1;
+    disposeWorkerClient();
+    setIsWorkerBacked(false);
+    setImageAssets(assets);
+    setWorkbook(nextWorkbook);
+    setSheets(nextSheets);
+    setChartAssets(charts);
+    setActiveSheetIndexState(nextIndex);
+    setActiveTabIndexState(Math.max(0, charts.tabs.findIndex((tab) => tab.kind === "sheet" && tab.sheetIndex === nextIndex)));
+    const activeCell = structureKnown && prior.activeCell ? transformCellAddress(prior.activeCell, prior.sheetName ?? "", transforms) : prior.activeCell;
+    const selection = structureKnown ? mapSelection(prior.selection, prior.sheetName ?? "") : null;
+    setActiveCell(activeCell);
+    setSelection(selection);
+    selectionAnchorRef.current = selection ? normalizeRange(selection).start : activeCell;
+    setSelectedChartId(null); setSelectedChartElement(null); setSelectedImageId(null);
+    undoStackRef.current = nextUndo; redoStackRef.current = nextRedo;
+    setHistoryRevision((value) => value + 1);
+    setSortState(null); setError(null);
+    structureRevisionRef.current += 1;
+    sourceStructureRevisionRef.current = structureRevisionRef.current;
+    currentRevisionRef.current = nextRevision;
+    cellJournalRef.current = remaining.map((entry) => ({ ...cloneCollaborationValue(entry), revision: nextRevision }));
+    journalFloorRevisionRef.current = cleanRevision;
+    unsupportedMutationRevisionRef.current = cleanRevision;
+    pendingMutationKindRef.current = null;
+    mutationNotificationStateRef.current = { baselineRevision: nextRevision, pendingRevision: null };
+    setRevision(nextRevision);
+    return { applied: true, revision: nextRevision, cleanRevision, structureRevision: structureRevisionRef.current, dirty: remaining.length > 0 };
+  }, [disposeWorkerClient, isLoading, loadWorkbookOnMainThread, maybeRecalculateWorkbook, setChartAssets, setImageAssets, showHiddenSheets, workbook]);
 
   const createHistoryEntry = React.useCallback((): SnapshotHistoryEntry | null => {
     if (!workbook) {
@@ -3514,6 +3762,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     applyCellMutationState(worksheet, entry.cell, targetState);
     maybeRecalculateWorkbook(workbook);
     refreshWorkbookState(workbook, "cells");
+    appendCellJournal(worksheet.name, entry.cell, direction === "undo" ? entry.after : entry.before, targetState);
 
     const nextActiveCell = direction === "undo" ? entry.activeCellBefore : entry.activeCellAfter;
     const nextSelection = direction === "undo" ? entry.selectionBefore : entry.selectionAfter;
@@ -3543,6 +3792,9 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
     maybeRecalculateWorkbook(workbook);
     refreshWorkbookState(workbook, entry.structural ? "structure" : "cells");
+    if (!entry.structural) for (const mutation of entry.mutations) {
+      appendCellJournal(worksheet.name, mutation.cell, direction === "undo" ? mutation.after : mutation.before, direction === "undo" ? mutation.before : mutation.after);
+    }
 
     const nextActiveCell = direction === "undo" ? entry.activeCellBefore : entry.activeCellAfter;
     const nextSelection = direction === "undo" ? entry.selectionBefore : entry.selectionAfter;
@@ -3713,6 +3965,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     pushHistoryEntry(undoStackRef.current, {
       kind: "cell-edit",
+      revision: currentRevisionRef.current,
       activeCellAfter: cell,
       activeCellBefore: activeCell,
       after,
@@ -3722,6 +3975,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       selectionBefore: selection,
       sheetIndex: activeSheet.workbookSheetIndex
     });
+    appendCellJournal(activeSheet.name, cell, before, after);
     redoStackRef.current = [];
     setHistoryRevision((current) => current + 1);
   }, [activeCell, activeSheet, selection]);
@@ -3738,6 +3992,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     pushHistoryEntry(undoStackRef.current, {
       kind: "range-edit",
+      revision: currentRevisionRef.current,
       structural,
       activeCellAfter,
       activeCellBefore: activeCell,
@@ -3746,6 +4001,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       selectionBefore: selection,
       sheetIndex: activeSheet.workbookSheetIndex
     });
+    if (!structural) for (const mutation of mutations) appendCellJournal(activeSheet.name, mutation.cell, mutation.before, mutation.after);
     redoStackRef.current = [];
     setHistoryRevision((current) => current + 1);
   }, [activeCell, activeSheet, selection]);
@@ -5380,6 +5636,9 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       structureRevision: structureRevisionRef.current,
       serializeXlsx,
       applyRemoteWorkbook,
+      captureCellDelta,
+      applyRemoteCells,
+      reconcileRemoteWorkbook,
       resizeChartBy,
       resizeImageBy,
       resizeColumn,
@@ -5502,6 +5761,9 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       revision,
       serializeXlsx,
       applyRemoteWorkbook,
+      captureCellDelta,
+      applyRemoteCells,
+      reconcileRemoteWorkbook,
       resizeChartBy,
       resizeImageBy,
       resizeColumn,

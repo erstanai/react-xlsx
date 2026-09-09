@@ -1,5 +1,6 @@
 export { useXlsxViewerController, XlsxFileSizeLimitExceededError } from "./controller";
 export { initWasm, setWasmSource, type XlsxWasmSource } from "./wasm";
+export type { XlsxCellContent, XlsxCellChange, XlsxCellDeltaCapture, XlsxStructureTransform, XlsxReconcileOptions, XlsxReconcileResult, XlsxCellConflict } from "./collaboration";
 export {
   DefaultXlsxToolbar,
   useXlsxViewerCharts,
