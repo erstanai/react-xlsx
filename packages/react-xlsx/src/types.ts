@@ -620,6 +620,10 @@ export interface XlsxFormControlChangeEvent {
 export interface XlsxMutationEvent {
   /** The controller revision containing the mutation. */
   revision: number;
+  /** Unknown and snapshot mutations are conservatively structural. */
+  kind: "cells" | "structure";
+  /** Monotonic within this controller, including structure undo and redo. */
+  structureRevision: number;
 }
 
 export interface XlsxFormControlRenderProps {
@@ -1104,11 +1108,19 @@ export interface XlsxViewerController {
   renameSheet: (index: number, name: string) => void;
   recalculate: () => void;
   revision: number;
+  /** Monotonic structure counter; compare it before merging cell edits. */
+  structureRevision: number;
   /**
    * Serializes the current workbook through the same sanitization and
    * image/chart asset merge path used by `exportXlsx()`.
    */
   serializeXlsx: () => Promise<Uint8Array>;
+  /**
+   * Applies an accepted collaboration checkpoint without emitting onMutation.
+   * Refuses stale revisions, keeps the current worksheet/selection, and clears
+   * undo/redo so local snapshot history cannot overwrite another editor.
+   */
+  applyRemoteWorkbook: (bytes: Uint8Array, options?: { expectedRevision?: number; canApply?: () => boolean }) => Promise<boolean>;
   resetZoom: () => void;
   resizeChartBy: (
     id: string,

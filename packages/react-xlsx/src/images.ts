@@ -9,6 +9,9 @@ import type {
 } from "@dukelib/sheets-wasm";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import { resolveWorkbookColor } from "./colors";
+import { preserveNamedWorkbookStyles } from "./preserved-styles";
+import { preserveCellOnlyWorkbookLayout } from "./preserved-cell-layout";
+import { invalidateDerivedChartCaches } from "./chart-derived-cache";
 import type {
   XlsxCellAddress,
   XlsxConditionalDataBarRule,
@@ -310,6 +313,8 @@ type WorkbookImageOrigin = {
 
 export type WorkbookImageSheetOrigin = {
   attachments: XlsxImageAttachment[];
+  /** Immutable source part path; workbookSheetIndex changes when tabs move. */
+  sheetPath?: string;
   workbookSheetIndex: number;
 };
 
@@ -3213,12 +3218,7 @@ export function parseWorkbookChartStyleAssets(bytes: Uint8Array): WorkbookChartS
       });
     }
 
-    sheetOrigins[workbookSheetIndex] = attachments.length > 0
-      ? {
-          attachments,
-          workbookSheetIndex
-        }
-      : null;
+    sheetOrigins[workbookSheetIndex] = { attachments, sheetPath: sheet.path, workbookSheetIndex };
   });
 
   return {
@@ -3293,12 +3293,7 @@ export function parseWorkbookImageAssets(
     formControlsByWorkbookSheetIndex[workbookSheetIndex] = formControls[workbookSheetIndex] ?? [];
     imagesByWorkbookSheetIndex[workbookSheetIndex] = imageList;
     shapesByWorkbookSheetIndex[workbookSheetIndex] = visibleShapeList;
-    sheetOrigins[workbookSheetIndex] = attachments.length > 0
-      ? {
-          attachments,
-          workbookSheetIndex
-        }
-      : null;
+    sheetOrigins[workbookSheetIndex] = { attachments, sheetPath: sheet.path, workbookSheetIndex };
   });
 
   return {
@@ -3524,6 +3519,204 @@ function appendSheetDrawingReference(
   }
 
   worksheet.appendChild(drawingNode);
+}
+
+const COMMENTS_REL_TYPE = `${REL_NS}/comments`;
+const VML_REL_TYPE = `${REL_NS}/vmlDrawing`;
+
+/** Cell relocation needs a note-anchor transform that Duke does not provide. */
+export function assertWorkbookNoteAnchorsCanStay(
+  sourceAssets: WorkbookImageAssets | null,
+  origin: WorkbookImageSheetOrigin | null | undefined
+) {
+  if (!sourceAssets || !origin?.sheetPath) return;
+  const relationships = parseRelationships(sourceAssets.archive, relsPathForDocument(origin.sheetPath), origin.sheetPath);
+  if ([...relationships.values()].some((relationship) => relationship.type === COMMENTS_REL_TYPE)) {
+    throw new Error("Cell relocation is unavailable while this worksheet contains preserved Excel notes.");
+  }
+}
+
+/**
+ * Duke retains some note references but omits their parts. Restore classic
+ * notes from their immutable source sheet, independently of drawing edits.
+ * Unexpected/mixed content fails closed so serializeXlsx never claims a
+ * faithful save after silently dropping an unsupported comment feature.
+ */
+export function mergeWorkbookCommentAssets(
+  savedBytes: Uint8Array,
+  sourceAssets: WorkbookImageAssets | null,
+  sheetOrigins: Array<WorkbookImageSheetOrigin | null>,
+  options: { preserveCellOnlyLayout?: boolean } = {}
+): Uint8Array {
+  if (!sourceAssets) return savedBytes;
+  const source = sourceAssets.archive;
+  if (Object.keys(source).some((path) => /^xl\/(threadedComments|persons)\//i.test(path))) {
+    throw new Error("Threaded Excel comments require the preserving value editor.");
+  }
+  const archive = unzipSync(savedBytes);
+  if (options.preserveCellOnlyLayout) {
+    const preserved = preserveCellOnlyWorkbookLayout(source, archive);
+    invalidateDerivedChartCaches(preserved);
+    return zipSync(preserved, { level: 6 });
+  }
+  if (source['xl/styles.xml'] && archive['xl/styles.xml']) {
+    archive['xl/styles.xml'] = strToU8(preserveNamedWorkbookStyles(strFromU8(source['xl/styles.xml']), strFromU8(archive['xl/styles.xml'])));
+  }
+  const sheets = parseWorkbookSheets(archive);
+  if (sheets.length !== sheetOrigins.length || sheetOrigins.some((origin) => origin && !origin.sheetPath)) {
+    throw new Error("Cannot preserve Excel notes without an exact worksheet mapping.");
+  }
+  const sourceTypes = parseXml(readArchiveText(source, "[Content_Types].xml") ?? "");
+  const targetTypes = ensureContentTypesDocument(archive);
+  if (!sourceTypes || !targetTypes) throw new Error("Cannot preserve Excel note content types.");
+  const sourceSheets = parseWorkbookSheets(source);
+  const sameSheetStructure = sourceSheets.length === sheets.length && sheets.every((sheet, index) => (
+    sheet.name === sourceSheets[index].name && sheetOrigins[index]?.sheetPath === sourceSheets[index].path
+  ));
+  if (sameSheetStructure) {
+    const rootRels = ensureRelationshipsDocument(archive, '_rels/.rels');
+    if (!rootRels) throw new Error('Cannot preserve workbook property relationships.');
+    for (const relation of parseRelationships(source, '_rels/.rels', '').values()) {
+      if (!/^docProps\/(app|core|custom)\.xml$/.test(relation.target)) continue;
+      if (relation.targetMode?.toLowerCase() === 'external' || !source[relation.target]) {
+        throw new Error('Cannot preserve workbook properties.');
+      }
+      archive[relation.target] = cloneBytes(source[relation.target]);
+      getLocalElements(rootRels, 'Relationship').filter((node) => node.getAttribute('Type') === relation.type).forEach((node) => node.remove());
+      const node = rootRels.createElementNS(PKG_REL_NS, 'Relationship');
+      node.setAttribute('Id', nextRelationshipId(rootRels));
+      node.setAttribute('Type', relation.type);
+      node.setAttribute('Target', relation.target);
+      rootRels.documentElement.appendChild(node);
+      mergeContentTypeForPath(targetTypes, sourceTypes, relation.target);
+    }
+    archive['_rels/.rels'] = strToU8(serializeXml(rootRels));
+  }
+  const copied = new Map<string, string>();
+  let commentIndex = 0;
+  let noteDrawingIndex = 0;
+  const copyPart = (path: string): string => {
+    const previous = copied.get(path);
+    if (previous) return previous;
+    const bytes = source[path];
+    if (!bytes) throw new Error(`Missing Excel note part: ${path}`);
+    // Root comment part names are understood by ExcelJS as well as Excel and
+    // Duke; openpyxl's nested names otherwise leave dangling loader references.
+    let targetPath = /^xl\/comments(?:\/|[^/]*\.xml$)/i.test(path)
+      ? `xl/comments${++commentIndex}.xml` : path;
+    // A generated drawing may occupy a source VML path after restructuring.
+    // Do not overwrite form controls with a note-only drawing or vice versa.
+    if (path.toLowerCase().endsWith('.vml')) {
+      const xml = strFromU8(bytes);
+      if (/ObjectType\s*=\s*["'](?!Note["'])/i.test(xml)) {
+        throw new Error("Mixed Excel note and form-control drawings require the preserving value editor.");
+      }
+      // ExcelJS indexes only vmlDrawingN names. Avoid any generated form
+      // control occupying that name; a generated note drawing is replaceable.
+      do {
+        targetPath = `xl/drawings/vmlDrawing${++noteDrawingIndex}.vml`;
+      } while (archive[targetPath] && /ObjectType\s*=\s*["'](?!Note["'])/i.test(strFromU8(archive[targetPath])));
+    }
+    copied.set(path, targetPath);
+    archive[targetPath] = cloneBytes(bytes);
+    if (targetPath !== path) {
+      if (![...copied.values()].includes(path)) {
+        delete archive[path];
+        getLocalElements(targetTypes, 'Override').filter((node) => node.getAttribute('PartName') === `/${path}`).forEach((node) => node.remove());
+      }
+      getLocalElements(targetTypes, 'Override').filter((node) => node.getAttribute('PartName') === `/${targetPath}`).forEach((node) => node.remove());
+      const type = targetTypes.createElementNS(CONTENT_TYPES_NS, 'Override');
+      type.setAttribute('PartName', `/${targetPath}`);
+      type.setAttribute('ContentType', path.toLowerCase().endsWith('.vml')
+        ? 'application/vnd.openxmlformats-officedocument.vmlDrawing'
+        : 'application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml');
+      targetTypes.documentElement.appendChild(type);
+    } else {
+      mergeContentTypeForPath(targetTypes, sourceTypes, path);
+    }
+    const relsPath = relsPathForDocument(path);
+    if (!source[relsPath]) return targetPath;
+    const rels = parseXml(strFromU8(source[relsPath]));
+    if (!rels) throw new Error('Cannot preserve Excel note relationships.');
+    for (const relation of parseRelationships(source, relsPath, path).values()) {
+      if (relation.targetMode?.toLowerCase() === 'external') throw new Error("External Excel note relationships are unsupported.");
+      const dependencyPath = copyPart(relation.target);
+      getLocalElements(rels, 'Relationship').find((node) => node.getAttribute('Id') === relation.id)
+        ?.setAttribute('Target', relativeArchivePath(targetPath, dependencyPath));
+    }
+    const targetRelsPath = relsPathForDocument(targetPath);
+    archive[targetRelsPath] = strToU8(serializeXml(rels));
+    mergeContentTypeForPath(targetTypes, sourceTypes, targetRelsPath);
+    return targetPath;
+  };
+  sheetOrigins.forEach((origin, index) => {
+    if (!origin?.sheetPath) return;
+    const relations = parseRelationships(source, relsPathForDocument(origin.sheetPath), origin.sheetPath);
+    const comments = [...relations.values()].filter((relation) => relation.type === COMMENTS_REL_TYPE);
+    const current = sheets[index];
+    const sourceSheet = parseXml(readArchiveText(source, origin.sheetPath) ?? '');
+    const targetSheet = parseXml(readArchiveText(archive, current.path) ?? '');
+    const relsPath = relsPathForDocument(current.path);
+    const targetRels = ensureRelationshipsDocument(archive, relsPath);
+    if (!sourceSheet || !targetSheet || !targetRels) throw new Error("Cannot preserve Excel note worksheet references.");
+    // Duke's reload adds showErrorMessage=true when the source omitted it.
+    // Keep the original validation options, while retaining generated formula
+    // text so worksheet renames continue to rewrite their references.
+    const validations = getLocalElements(sourceSheet, 'dataValidation');
+    const targetValidations = getLocalElements(targetSheet, 'dataValidation');
+    for (const original of validations) {
+      const target = targetValidations.find((node) => node.getAttribute('sqref') === original.getAttribute('sqref'));
+      if (!target) throw new Error('Cannot preserve Excel validation after a structural change.');
+      for (const attribute of Array.from(target.attributes)) {
+        if (!original.hasAttributeNS(attribute.namespaceURI, attribute.localName)) target.removeAttributeNode(attribute);
+      }
+      for (const attribute of Array.from(original.attributes)) {
+        target.setAttributeNS(attribute.namespaceURI, attribute.name, attribute.value);
+      }
+    }
+    archive[current.path] = strToU8(serializeXml(targetSheet));
+    if (!comments.length) return;
+    const legacy = getLocalElements(sourceSheet, 'legacyDrawing');
+    const legacyIds = new Set(legacy.map(getRelationshipId));
+    const preserved = [...comments, ...[...relations.values()].filter((relation) => relation.type === VML_REL_TYPE && legacyIds.has(relation.id))];
+    if (legacy.length) {
+      for (const relation of parseRelationships(archive, relsPath, current.path).values()) {
+        if (relation.type === VML_REL_TYPE && archive[relation.target]
+          && /ObjectType\s*=\s*["'](?!Note["'])/i.test(strFromU8(archive[relation.target]))) {
+          throw new Error("Excel note references conflict with a generated form control.");
+        }
+      }
+    }
+    // Remove only the corresponding note relationships; unrelated hyperlinks,
+    // charts, tables and drawing relationships remain intact.
+    getLocalElements(targetRels, 'Relationship')
+      .filter((node) => node.getAttribute('Type') === COMMENTS_REL_TYPE
+        || (legacy.length > 0 && node.getAttribute('Type') === VML_REL_TYPE))
+      .forEach((node) => node.remove());
+    if (legacy.length) getLocalElements(targetSheet, 'legacyDrawing').forEach((node) => node.remove());
+    for (const relation of preserved) {
+      if (relation.targetMode?.toLowerCase() === 'external') throw new Error("External Excel note relationships are unsupported.");
+      const targetPath = copyPart(relation.target);
+      const id = nextRelationshipId(targetRels);
+      const node = targetRels.createElementNS(PKG_REL_NS, 'Relationship');
+      node.setAttribute('Id', id);
+      node.setAttribute('Type', relation.type);
+      node.setAttribute('Target', relativeArchivePath(current.path, targetPath));
+      targetRels.documentElement.appendChild(node);
+      for (const original of legacy.filter((entry) => getRelationshipId(entry) === relation.id)) {
+        const reference = targetSheet.importNode(original, true);
+        reference.setAttributeNS(REL_NS, 'r:id', id);
+        const extLst = getFirstChild(targetSheet.documentElement, 'extLst');
+        targetSheet.documentElement.insertBefore(reference, extLst ?? null);
+      }
+    }
+    archive[current.path] = strToU8(serializeXml(targetSheet));
+    archive[relsPath] = strToU8(serializeXml(targetRels));
+    mergeContentTypeForPath(targetTypes, sourceTypes, relsPath);
+  });
+  archive['[Content_Types].xml'] = strToU8(serializeXml(targetTypes));
+  invalidateDerivedChartCaches(archive);
+  return zipSync(archive, { level: 6 });
 }
 
 export function mergeWorkbookImageAssets(

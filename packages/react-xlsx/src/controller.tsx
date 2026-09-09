@@ -26,6 +26,8 @@ import {
   collectWorkbookFormControls,
   dukeDrawingAnchorToXlsxAnchor,
   mergeWorkbookImageAssets,
+  mergeWorkbookCommentAssets,
+  assertWorkbookNoteAnchorsCanStay,
   parseWorkbookImageAssets,
   pxToSheetColumnWidth,
   rectToImageAnchor,
@@ -174,6 +176,7 @@ type RangeCellMutation = {
 };
 
 type RangeEditHistoryEntry = {
+  structural?: boolean;
   kind: "range-edit";
   activeCellAfter: XlsxCellAddress | null;
   activeCellBefore: XlsxCellAddress | null;
@@ -1933,6 +1936,17 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
   const [selectedChartElement, setSelectedChartElement] = React.useState<XlsxChartElementSelection | null>(null);
   const [selectedImageId, setSelectedImageId] = React.useState<string | null>(null);
   const [revision, setRevision] = React.useState(0);
+  const currentRevisionRef = React.useRef(0);
+  const remoteLoadGenerationRef = React.useRef(0);
+  const structureRevisionRef = React.useRef(0);
+  const sourceStructureRevisionRef = React.useRef(0);
+  const pendingMutationKindRef = React.useRef<"cells" | "structure" | null>(null);
+  const advanceRevision = React.useCallback((kind: "cells" | "structure" = "structure") => {
+    currentRevisionRef.current += 1;
+    if (kind === "structure") structureRevisionRef.current += 1;
+    pendingMutationKindRef.current = pendingMutationKindRef.current === "structure" ? "structure" : kind;
+    setRevision((current) => current + 1);
+  }, []);
   const selectionAnchorRef = React.useRef<XlsxCellAddress | null>(null);
   const undoStackRef = React.useRef<HistoryEntry[]>([]);
   const redoStackRef = React.useRef<HistoryEntry[]>([]);
@@ -2004,6 +2018,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
   const setImageAssets = React.useCallback((assets: WorkbookImageAssets | null) => {
     revokeWorkbookImageAssets(imageAssetsRef.current);
     imageAssetsRef.current = assets;
+    sourceStructureRevisionRef.current = structureRevisionRef.current;
     sheetOriginsRef.current = assets?.sheetOrigins.slice() ?? [];
     setFormControlsByWorkbookSheetIndex(assets?.formControlsByWorkbookSheetIndex ?? []);
     setImagesByWorkbookSheetIndex(assets?.imagesByWorkbookSheetIndex ?? []);
@@ -2213,7 +2228,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     };
   }, [skipXmlParsing]);
 
-  const refreshWorkbookState = React.useCallback((targetWorkbook: Workbook) => {
+  const refreshWorkbookState = React.useCallback((targetWorkbook: Workbook, kind: "cells" | "structure" = "structure") => {
     const currentFormControls = imageAssetsRef.current?.formControlsByWorkbookSheetIndex ?? [];
     const nextFormControls = refreshWorkbookFormControls(
       targetWorkbook,
@@ -2242,10 +2257,11 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
         showHiddenSheets
       )
     );
-    setRevision((current) => current + 1);
-  }, [setChartAssets, showHiddenSheets]);
+    advanceRevision(kind);
+  }, [advanceRevision, setChartAssets, showHiddenSheets]);
 
   React.useEffect(() => () => {
+    remoteLoadGenerationRef.current += 1;
     chartDisplayFallbackCleanupRef.current?.();
     chartDisplayFallbackCleanupRef.current = null;
     revokeWorkbookImageAssets(imageAssetsRef.current);
@@ -2264,11 +2280,19 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     );
     mutationNotificationStateRef.current = transition.state;
     if (transition.notificationRevision !== null) {
-      onMutation?.({ revision: transition.notificationRevision });
+      onMutation?.({
+        revision: transition.notificationRevision,
+        kind: pendingMutationKindRef.current ?? "structure",
+        structureRevision: structureRevisionRef.current
+      });
+      pendingMutationKindRef.current = null;
+    } else if (transition.state.baselineRevision === null) {
+      pendingMutationKindRef.current = null;
     }
   }, [isChartsLoading, isLoading, onMutation, revision, workbook]);
 
   React.useEffect(() => {
+    remoteLoadGenerationRef.current += 1;
     if (!file && !src) {
       disposeWorkerClient();
       setForcedReadOnly(false);
@@ -2299,6 +2323,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       setSortState(null);
       setZoomScaleOverridesByTabId({});
       setRevision(0);
+      currentRevisionRef.current = 0;
       return;
     }
 
@@ -2329,6 +2354,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setSortState(null);
     setZoomScaleOverridesByTabId({});
     setRevision(0);
+    currentRevisionRef.current = 0;
     disposeWorkerClient();
 
     void resolveWorkbookBuffer({ file, src }, abortController.signal)
@@ -3339,10 +3365,11 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
   const createSavedWorkbookBytes = React.useCallback((targetWorkbook: Workbook) => {
     return createPersistedWorkbookBytes(
       targetWorkbook,
-      (savedBytes) => mergeWorkbookImageAssets(
-        savedBytes,
+      (savedBytes) => mergeWorkbookCommentAssets(
+        mergeWorkbookImageAssets(savedBytes, imageAssetsRef.current, sheetOriginsRef.current),
         imageAssetsRef.current,
-        sheetOriginsRef.current
+        sheetOriginsRef.current,
+        { preserveCellOnlyLayout: sourceStructureRevisionRef.current === structureRevisionRef.current }
       )
     );
   }, []);
@@ -3354,6 +3381,61 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     return createSavedWorkbookBytes(workbook);
   }, [createSavedWorkbookBytes, workbook]);
+
+  const remoteSelectionRef = React.useRef({ activeCell, selection, activeSheetIndex, sheetName: activeSheet?.name });
+  remoteSelectionRef.current = { activeCell, selection, activeSheetIndex, sheetName: activeSheet?.name };
+  const applyRemoteWorkbook = React.useCallback(async (
+    bytes: Uint8Array,
+    remoteOptions: { expectedRevision?: number; canApply?: () => boolean } = {}
+  ): Promise<boolean> => {
+    const expected = remoteOptions.expectedRevision ?? currentRevisionRef.current;
+    if (expected !== currentRevisionRef.current || isLoading || remoteOptions.canApply?.() === false) return false;
+    const generation = ++remoteLoadGenerationRef.current;
+    const parsed = await loadWorkbookOnMainThread(cloneBytes(bytes).buffer as ArrayBuffer);
+    if (generation !== remoteLoadGenerationRef.current || expected !== currentRevisionRef.current || remoteOptions.canApply?.() === false) {
+      revokeWorkbookImageAssets(parsed.imageAssets);
+      return false;
+    }
+    const nextWorkbook = parsed.parsedWorkbook.workbook;
+    const assets = parsed.imageAssets;
+    const nextSheets = buildSheetList(nextWorkbook, assets.sheetStatesByWorkbookSheetIndex, assets.themePalette,
+      assets.styleById, assets.namedCellStyleByName, assets.tableStyleByName, showHiddenSheets);
+    const prior = remoteSelectionRef.current;
+    const matchingIndex = nextSheets.findIndex((sheet) => sheet.name === prior.sheetName);
+    const nextIndex = matchingIndex >= 0 ? matchingIndex : Math.max(0, Math.min(prior.activeSheetIndex, nextSheets.length - 1));
+    const charts = loadWorkbookChartAssets(nextWorkbook, assets, buildVisibleSheetIndexMap(nextSheets), showHiddenSheets);
+    chartLoadRequestTokenRef.current += 1;
+    disposeWorkerClient();
+    setIsWorkerBacked(false);
+    setImageAssets(assets);
+    setWorkbook(nextWorkbook);
+    setSheets(nextSheets);
+    setChartAssets(charts);
+    setActiveSheetIndexState(nextIndex);
+    const nextTab = charts.tabs.findIndex((tab) => tab.kind === "sheet" && tab.sheetIndex === nextIndex);
+    setActiveTabIndexState(Math.max(0, nextTab));
+    setActiveCell(prior.activeCell);
+    setSelection(prior.selection);
+    selectionAnchorRef.current = prior.selection ? normalizeRange(prior.selection).start : prior.activeCell;
+    setSelectedChartId(null);
+    setSelectedChartElement(null);
+    setSelectedImageId(null);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    setHistoryRevision((current) => current + 1);
+    setSortState(null);
+    setError(null);
+    // Treat this authoritative snapshot as a new baseline. Suppress echo and
+    // invalidate snapshot undo without erasing the monotonic structure fence.
+    const nextRevision = currentRevisionRef.current + 1;
+    currentRevisionRef.current = nextRevision;
+    structureRevisionRef.current += 1;
+    sourceStructureRevisionRef.current = structureRevisionRef.current;
+    pendingMutationKindRef.current = null;
+    mutationNotificationStateRef.current = { baselineRevision: nextRevision, pendingRevision: null };
+    setRevision(nextRevision);
+    return true;
+  }, [disposeWorkerClient, isLoading, loadWorkbookOnMainThread, setChartAssets, setImageAssets, showHiddenSheets]);
 
   const createHistoryEntry = React.useCallback((): SnapshotHistoryEntry | null => {
     if (!workbook) {
@@ -3412,7 +3494,8 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setActiveCell(entry.activeCell);
     setSelection(entry.selection);
     selectionAnchorRef.current = entry.selection ? normalizeRange(entry.selection).start : entry.activeCell;
-    setRevision((current) => current + 1);
+    advanceRevision();
+    sourceStructureRevisionRef.current = structureRevisionRef.current;
   }, [setChartAssets, setImageAssets]);
 
   const applyCellEditHistoryEntry = React.useCallback((
@@ -3430,7 +3513,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     isApplyingHistoryRef.current = true;
     applyCellMutationState(worksheet, entry.cell, targetState);
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
 
     const nextActiveCell = direction === "undo" ? entry.activeCellBefore : entry.activeCellAfter;
     const nextSelection = direction === "undo" ? entry.selectionBefore : entry.selectionAfter;
@@ -3459,7 +3542,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       applyCellMutationState(worksheet, mutation.cell, direction === "undo" ? mutation.before : mutation.after);
     }
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, entry.structural ? "structure" : "cells");
 
     const nextActiveCell = direction === "undo" ? entry.activeCellBefore : entry.activeCellAfter;
     const nextSelection = direction === "undo" ? entry.selectionBefore : entry.selectionAfter;
@@ -3646,7 +3729,8 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
   const recordRangeEditHistory = React.useCallback((
     mutations: RangeCellMutation[],
     selectionAfter: XlsxCellRange | null,
-    activeCellAfter: XlsxCellAddress | null
+    activeCellAfter: XlsxCellAddress | null,
+    structural = false
   ) => {
     if (!activeSheet || isApplyingHistoryRef.current || mutations.length === 0) {
       return;
@@ -3654,6 +3738,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     pushHistoryEntry(undoStackRef.current, {
       kind: "range-edit",
+      structural,
       activeCellAfter,
       activeCellBefore: activeCell,
       mutations,
@@ -3738,6 +3823,8 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return;
     }
 
+    assertWorkbookNoteAnchorsCanStay(imageAssetsRef.current, sheetOriginsRef.current[activeSheet.workbookSheetIndex]);
+
     const mutations: RangeCellMutation[] = [];
     for (let rowOffset = 0; rowOffset < rows.length; rowOffset += 1) {
       const targetRow = dataStartRow + rowOffset;
@@ -3767,7 +3854,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     maybeRecalculateWorkbook(workbook);
     refreshWorkbookState(workbook);
     setSortState({ columnIndex, direction, tableName: targetTable.name });
-    recordRangeEditHistory(mutations, selection, activeCell);
+    recordRangeEditHistory(mutations, selection, activeCell, true);
   }, [
     activeCell,
     activeSheet,
@@ -3875,7 +3962,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
         rowHeights: nextRowHeights
       };
     }));
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [activeSheet]);
 
   const resizeColumn = React.useCallback((col: number, widthPx: number) => {
@@ -4035,7 +4122,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setChartsByWorkbookSheetIndex((current) => current.map((sheetCharts) => (
       sheetCharts.map((chart) => chart.id === id ? { ...chart, anchor: nextAnchor } : chart)
     )));
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [
     activeSheet,
     getChartById,
@@ -4072,7 +4159,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
 
     setImagesByWorkbookSheetIndex([...imageAssetsRef.current.imagesByWorkbookSheetIndex]);
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [
     activeSheet,
     getColumnWidthPx,
@@ -4256,7 +4343,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     setChartsByWorkbookSheetIndex((current) => current.map((sheetCharts) => (
       sheetCharts.map((chart) => chart.id === id ? { ...chart, ...patch } : chart)
     )));
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [ensureChartAssetsHydrated, getChartById, readOnly, recordHistoryBeforeMutation, sheets, workbook]);
 
   const setChartSeriesFormula = React.useCallback((chartId: string, seriesIndex: number, formula: string) => {
@@ -4358,7 +4445,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
 
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     recordRangeEditHistory(mutations, normalized, activeCell ?? normalized.start);
   }, [
     activeCell,
@@ -4404,7 +4491,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return;
     }
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     recordCellEditHistory(cell, before, after);
   }, [captureCellMutationState, getActiveWorksheet, maybeRecalculateWorkbook, readOnly, recordCellEditHistory, refreshWorkbookState, workbook]);
 
@@ -4430,7 +4517,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return;
     }
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     recordCellEditHistory(cell, before, after);
   }, [captureCellMutationState, getActiveWorksheet, maybeRecalculateWorkbook, readOnly, recordCellEditHistory, refreshWorkbookState, workbook]);
 
@@ -4451,7 +4538,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       return;
     }
 
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     recordCellEditHistory(cell, before, after);
   }, [captureCellMutationState, getActiveWorksheet, readOnly, recordCellEditHistory, refreshWorkbookState, workbook]);
 
@@ -4532,7 +4619,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       });
     }
 
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     recordRangeEditHistory(mutations, selection, activeCell);
   }, [activeCell, captureCellMutationState, getActiveWorksheet, readOnly, recordRangeEditHistory, refreshWorkbookState, selection, workbook]);
 
@@ -4598,7 +4685,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
 
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     setSelection(nextRange);
     setActiveCell(nextRange.end);
     selectionAnchorRef.current = nextRange.start;
@@ -4674,7 +4761,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     if (nextTabIndex >= 0) {
       setActiveTabIndexState(nextTabIndex);
     }
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [readOnly, recordHistoryBeforeMutation, setChartAssets, workbook]);
 
   const renameSheet = React.useCallback((index: number, name: string) => {
@@ -4834,7 +4921,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     setSelectedChartId(null);
     setSelectedChartElement(null);
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [
     activeTab,
     createHistoryEntry,
@@ -4880,7 +4967,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       setChartAssets(loadWorkbookChartAssets(workbook, imageAssetsRef.current, buildVisibleSheetIndexMap(nextSheets), showHiddenSheets));
     }
     setActiveSheetIndexState((current) => Math.max(0, Math.min(current, nextSheets.length - 1)));
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [activeSheet, readOnly, recordHistoryBeforeMutation, setChartAssets, workbook]);
 
   const defineNamedRange = React.useCallback((name: string, range?: XlsxCellRange | null) => {
@@ -4900,7 +4987,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
 
     recordHistoryBeforeMutation();
     workbook.defineName(trimmed, rangeToA1(targetRange));
-    setRevision((current) => current + 1);
+    advanceRevision();
   }, [readOnly, recordHistoryBeforeMutation, selection, workbook]);
 
   const pasteText = React.useCallback((text: string) => {
@@ -4967,7 +5054,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
 
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, "cells");
     const nextRange = tiled && selectedRange
       ? selectedRange
       : normalizeRange({
@@ -5077,7 +5164,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
     }
 
     maybeRecalculateWorkbook(workbook);
-    refreshWorkbookState(workbook);
+    refreshWorkbookState(workbook, hasMergeOperations ? "structure" : "cells");
     const nextRange = tiled && selectedRange
       ? selectedRange
       : normalizeRange({
@@ -5290,7 +5377,9 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       renameSheet,
       resetZoom,
       revision,
+      structureRevision: structureRevisionRef.current,
       serializeXlsx,
+      applyRemoteWorkbook,
       resizeChartBy,
       resizeImageBy,
       resizeColumn,
@@ -5412,6 +5501,7 @@ export function useXlsxViewerController(options: UseXlsxViewerControllerOptions)
       renameSheet,
       revision,
       serializeXlsx,
+      applyRemoteWorkbook,
       resizeChartBy,
       resizeImageBy,
       resizeColumn,

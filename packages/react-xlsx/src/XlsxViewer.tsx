@@ -6499,6 +6499,7 @@ function GridRow({
             ) : null}
             {isEditing ? (
               <input
+                data-xlsx-cell-editor="true"
                 autoFocus
                 onBlur={onEditingBlur}
                 onChange={(event) => onEditingValueChange(event.target.value)}
@@ -9010,6 +9011,10 @@ function XlsxGrid({
         return;
       }
 
+      // Keep the input focused until the cell handler has classified a
+      // formula-reference click; this document capture runs before React.
+      if (editingCellRef.current) return;
+
       gridKeyboardActiveRef.current = true;
       focusGridElement(scroller);
     };
@@ -11467,6 +11472,7 @@ function XlsxGrid({
     }
 
     event.preventDefault();
+    if (editingCellRef.current && !isSameCell(activeCellRef.current, cell) && tryFormulaPointInsert(cell)) return;
     focusGrid();
     axisSelectionRef.current = null;
     const currentSelection = selectionRef.current;
@@ -11515,7 +11521,8 @@ function XlsxGrid({
     resolvePointerCellFromClient,
     rowIndexByActual,
     rowPrefixSums,
-    startCellSelection
+    startCellSelection,
+    tryFormulaPointInsert
   ]);
 
   const handleCanvasBodyClick = React.useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
@@ -15225,6 +15232,9 @@ function XlsxGrid({
       if (isInteractiveFocusTarget(event.target, event.currentTarget)) {
         return;
       }
+      // The cell handler must decide whether this click points into a formula
+      // before any focus change blurs (and commits) the active editor.
+      if (editingCellRef.current) return;
 
       gridKeyboardActiveRef.current = true;
       focusGridElement(event.currentTarget);
@@ -15233,6 +15243,7 @@ function XlsxGrid({
       if (isInteractiveFocusTarget(event.target, event.currentTarget)) {
         return;
       }
+      if (editingCellRef.current) return;
 
       gridKeyboardActiveRef.current = true;
       focusGridElement(event.currentTarget);
@@ -15479,6 +15490,7 @@ function XlsxGrid({
                   >
                     <input
                       ref={editingInputRef}
+                      data-xlsx-cell-editor="true"
                       autoFocus
                       onBlur={handleEditingBlur}
                       onChange={(event) => {
