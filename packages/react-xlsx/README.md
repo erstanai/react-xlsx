@@ -669,6 +669,14 @@ function Workbook() {
 
 ## Workbook Support
 
+The Erstan fork's `serializeXlsx()` preserves imported workbook layout, charts, drawing parts, notes, validation options, and style metadata during cell edits. A structural revision fence prevents this preservation path from undoing structural changes. Notes remain associated with the original worksheet after rename or reorder. Threaded comments, mixed note/control drawings, and cell relocation on note-bearing sheets fail safely when faithful preservation is unavailable.
+
+Chart data is resolved from referenced cells in the editor. Serialization invalidates reference-derived chart caches so exports cannot carry stale cached points; chart formulas, literal points, and presentation remain intact.
+
+`onMutation` reports `{ revision, kind: 'cells' | 'structure', structureRevision }`. The structure counter advances for structural or unclassified changes, including structural undo/redo, so integrations can allow cell merging only against an unchanged structure baseline.
+
+`controller.applyRemoteWorkbook(bytes, { expectedRevision?, canApply? })` returns `Promise<boolean>`. It parses an authoritative workbook separately, rechecks the local revision and optional editing guard before applying, preserves the active worksheet and selection where possible, and emits no local mutation. A successful remote update advances both revision counters once and clears undo and redo: earlier local history cannot safely cross the new shared workbook. Integrations should defer updates while a cell, formula, or worksheet name has uncommitted input.
+
 Primary support is for OOXML `.xlsx` workbooks.
 
 Supported worksheet features include:
